@@ -66,7 +66,10 @@ class MoEAllGatherTokenDispatcher(MoETokenDispatcher):
         Initialize the zero token dropping router.
         """
         super().__init__(config=config)
-        self.num_local_experts = num_local_experts
+        self.num_local_experts = num_local_experts # number of experts per GPU
+        self.num_experts = config.num_moe_experts # total number of experts
+        self.num_gpus = parallel_state.get_expert_model_parallel_world_size() # total number of gpus
+        self.rank = parallel_state.get_tensor_model_parallel_rank() # current rank
         assert self.num_local_experts > 0, "Expected at least one expert"
         self.local_expert_indices = local_expert_indices
         assert len(self.local_expert_indices) > 0, "Expected at least one local expert index"
@@ -116,11 +119,31 @@ class MoEAllGatherTokenDispatcher(MoETokenDispatcher):
                 global_indices = tensor_parallel.gather_from_sequence_parallel_region_to_moe(
                     max_ind
                 )
-                # Create a mask of mapping between global and local tokens where each
-                # element is True if it's between the local_expert_indices
-                global_local_mask = (global_indices >= self.local_expert_indices[0]) & (
-                    global_indices <= self.local_expert_indices[-1]
-                )
+
+                if self.config.enable_esmoe:
+                    # expert placement algorithm -- needs to be optimized
+                    # number of tokens per expert
+                    bincount = torch.bincount(torch.squeeze(global_indices.cpu()))
+                    sorted_bincount, sorted_expert_indices = torch.sort(bincount, descending=True)
+                    gpu_token_assign_count = torch.zeros(self.num_gpus)
+                    indices_per_gpu = torch.zeros((self.num_gpus, self.num_experts//self.num_gpus))
+                    indices_per_gpu_append = torch.zeros(self.num_gpus)
+                    for index in sorted_expert_indices:
+                        gpu_index = torch.argmin(gpu_token_assign_count)
+                        indices_per_gpu[gpu_index][int(indices_per_gpu_append[gpu_index])]=index
+                        indices_per_gpu_append[gpu_index]+=1
+                        gpu_token_assign_count[gpu_index]+=bincount[index]
+                        if indices_per_gpu_append[gpu_index]==self.num_experts//self.num_gpus:
+                            gpu_token_assign_count[gpu_index]+=98765
+                    indices_per_gpu = indices_per_gpu.to(global_indices.device)
+                    global_local_mask = torch.isin(global_indices, indices_per_gpu[self.local_expert_indices[0]//self.num_local_experts].type(torch.int))
+                else:
+                    # Create a mask of mapping between global and local tokens where each
+                    # element is True if it's between the local_expert_indices
+                    global_local_mask = (global_indices >= self.local_expert_indices[0]) & (
+                        global_indices <= self.local_expert_indices[-1]
+                    )
+                
                 local_indices = global_indices.masked_select(global_local_mask)
 
             if self.router_topk > 1:  # k > 1
@@ -164,9 +187,17 @@ class MoEAllGatherTokenDispatcher(MoETokenDispatcher):
         # Reshape indices to be compatible with Tensor.gather
         self.indices = self.indices.view(-1, 1).expand(-1, hidden_states.shape[-1])
         permuted_local_hidden_states = torch.gather(local_hidden_states, 0, self.indices)
+
+        if self.config.enable_esmoe:
+            return (
+                permuted_local_hidden_states,
+                tokens_per_expert,
+                indices_per_gpu[self.local_expert_indices[0]//self.num_local_experts].type(torch.int)
+            )
+
         return (
             permuted_local_hidden_states,
-            tokens_per_expert,
+            tokens_per_expert
         )
 
     def token_unpermutation(

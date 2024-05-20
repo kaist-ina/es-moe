@@ -1,5 +1,7 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
+from enum import Enum
+from typing import Optional
 import torch
 
 from megatron.core import parallel_state
@@ -227,3 +229,18 @@ def track_moe_metrics(
                     )
 
     clear_aux_losses_tracker()
+
+
+class ExpertPinState(Enum):
+    """Enum for expert pin state."""
+    UNPINNED = 0
+    PINNING = 1
+    PINNED = 2
+    UNPINNING = 3
+
+class EsMoeParameter(torch.nn.Parameter):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._cpu: Optional[torch.Tensor] = None
+        self._gpu: Optional[torch.Tensor] = None
+        self._cpu_grad: Optional[torch.Tensor] = None

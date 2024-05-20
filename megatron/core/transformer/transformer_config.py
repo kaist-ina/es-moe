@@ -252,6 +252,17 @@ class TransformerConfig(ModelParallelConfig):
     """Enable per-layer logging for MoE, currently supports auxiliary loss and z loss."""
 
     ####################
+    # ES-MoE
+    ####################
+
+    enable_esmoe: bool = False
+    num_experts_pin: int = 0
+    """ num of pinned experts"""
+    partial_offload: bool = False
+    """pinned expert exist -> True"""
+    moe_offload: bool = False
+
+    ####################
     # miscellaneous
     ####################
     clone_scatter_output_in_embedding: bool = True

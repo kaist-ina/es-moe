@@ -45,7 +45,8 @@ GPT_ARGS="
     --num-experts 12 \
     --expert-model-parallel-size 4 \
     --moe-router-topk 1 \
-    --use-distributed-optimizer
+    --use-distributed-optimizer \
+    --enable-esmoe
 "
 
 DATA_ARGS="

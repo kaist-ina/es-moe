@@ -43,6 +43,7 @@ def parse_args(extra_args_provider=None, ignore_unknown_args=False):
     parser = _add_transformer_engine_args(parser)
     parser = _add_retro_args(parser)
     parser = _add_experimental_args(parser)
+    parser = _add_esmoe_args(parser)
 
     # Custom arguments.
     if extra_args_provider is not None:
@@ -1636,4 +1637,10 @@ def _add_experimental_args(parser):
     group.add_argument('--yaml-cfg', type=str, default=None,
                        help = 'Config file to add additional arguments')
 
+    return parser
+
+def _add_esmoe_args(parser):
+    group = parser.add_argument_group(title="esmoe")
+    group.add_argument('--enable-esmoe', action='store_true',
+                       help='Enable ESMoE')
     return parser

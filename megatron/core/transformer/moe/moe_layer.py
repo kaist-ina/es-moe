@@ -83,6 +83,9 @@ class MoELayer(BaseMoELayer):
             )
 
     def forward(self, hidden_states: torch.Tensor):
+        if self.config.enable_esmoe:
+            return self.forward_esmoe(hidden_states)
+
         # process MoE
         scores, indices = self.router(hidden_states)
         (dispatched_input, tokens_per_expert) = self.token_dispatcher.token_permutation(
@@ -90,4 +93,34 @@ class MoELayer(BaseMoELayer):
         )
         expert_output, mlp_bias = self.experts(dispatched_input, tokens_per_expert)
         output, mlp_bias = self.token_dispatcher.token_unpermutation(expert_output, mlp_bias)
+        return output, mlp_bias
+
+    def forward_esmoe(self, hidden_states: torch.Tensor):
+
+        # Lazy Initialize
+        if not self.experts.lazy_initialized:
+            self.experts.lazy_init(self.layer_number)
+
+        # process MoE
+        scores, indices = self.router(hidden_states)
+        (dispatched_input, tokens_per_expert, expert_indices) = self.token_dispatcher.token_permutation(
+            hidden_states, scores, indices
+        )
+
+        self.experts.wait_for_previous_optim_step()
+
+        event_non_expert_compute = torch.cuda.Event()
+        event_non_expert_compute.record()
+        for expert_index in expert_indices:
+            # probably can wait computation stream instead of communication stream
+            self.experts._streams["communication"].wait_event(event_non_expert_compute)
+            self.experts._upload_experts(expert_index.item(), True)
+
+        # call to self.expert will make the default stream wait for the computation stream to finish
+        expert_output, mlp_bias = self.experts(dispatched_input, tokens_per_expert, expert_indices)
+
+        output, mlp_bias = self.token_dispatcher.token_unpermutation(expert_output, mlp_bias)
+
+        print (f"GPU{parallel_state.get_expert_model_parallel_rank()} Layer{self.layer_number} FORWARD DONE")
+
         return output, mlp_bias
