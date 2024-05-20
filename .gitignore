@@ -7,3 +7,11 @@ build
 slurm*
 logs
 .vscode
+
+**/*.zip
+gpt2-merges.txt
+gpt2-vocab.json
+**/*.bin
+**/*.idx
+my-gpt2_text_document
+examples
