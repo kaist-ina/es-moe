@@ -4,7 +4,7 @@
 
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 
-GPUS_PER_NODE=8
+GPUS_PER_NODE=4
 # Change for multinode config
 MASTER_ADDR=localhost
 MASTER_PORT=6000
@@ -12,10 +12,10 @@ NNODES=1
 NODE_RANK=0
 WORLD_SIZE=$(($GPUS_PER_NODE*$NNODES))
 
-CHECKPOINT_PATH=<Specify path>
-VOCAB_FILE=<Specify path to file>/gpt2-vocab.json
-MERGE_FILE=<Specify path to file>/gpt2-merges.txt
-DATA_PATH=<Specify path and file prefix>_text_document
+CHECKPOINT_PATH=checkpoints
+VOCAB_FILE=gpt2-vocab.json
+MERGE_FILE=gpt2-merges.txt
+DATA_PATH=my-gpt2_text_document
 
 DISTRIBUTED_ARGS="
     --nproc_per_node $GPUS_PER_NODE \
@@ -26,7 +26,7 @@ DISTRIBUTED_ARGS="
 "
 
 GPT_ARGS="
-    --num-layers 24 \
+    --num-layers 4 \
     --hidden-size 1024 \
     --num-attention-heads 16 \
     --seq-length 1024 \
@@ -41,7 +41,11 @@ GPT_ARGS="
     --weight-decay 1e-2 \
     --lr-warmup-fraction .01 \
     --clip-grad 1.0 \
-    --fp16
+    --use-mcore-models \
+    --num-experts 12 \
+    --expert-model-parallel-size 4 \
+    --moe-router-topk 1 \
+    --use-distributed-optimizer
 "
 
 DATA_ARGS="
@@ -52,7 +56,7 @@ DATA_ARGS="
 "
 
 OUTPUT_ARGS="
-    --log-interval 100 \
+    --log-interval 1 \
     --save-interval 10000 \
     --eval-interval 1000 \
     --eval-iters 10
