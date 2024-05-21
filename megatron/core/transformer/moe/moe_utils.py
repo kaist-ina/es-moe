@@ -1,6 +1,6 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
-from enum import Enum
+from enum import Enum, IntEnum
 from typing import Optional
 import torch
 
@@ -238,6 +238,13 @@ class ExpertPinState(Enum):
     PINNED = 2
     UNPINNING = 3
 
+class ParamType(IntEnum):
+    PARAM = 1
+    GRAD = 2
+    OPTIM_EXP_AVG = 3
+    OPTIM_EXP_AVG_SQ = 4
+    OPTIM_STEP = 5
+    
 class EsMoeParameter(torch.nn.Parameter):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)

@@ -107,6 +107,8 @@ class MoELayer(BaseMoELayer):
             hidden_states, scores, indices
         )
 
+        print(f"GPU{parallel_state.get_expert_model_parallel_rank()} Layer{self.layer_number} FORWARD START")
+
         self.experts.wait_for_previous_optim_step()
 
         event_non_expert_compute = torch.cuda.Event()

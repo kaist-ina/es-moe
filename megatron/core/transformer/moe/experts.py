@@ -2,6 +2,8 @@
 
 from collections import defaultdict
 from functools import partial
+import threading
+import queue
 from typing import Dict, List, Optional, Tuple, Union, Literal
 
 import numpy as np
@@ -12,6 +14,7 @@ from torch.nn.parameter import Parameter
 import segment_manager
 from shared_pinned_memory import upload_experts_params, offload_experts_grads, free_params
 
+from megatron.core.optimizer.esmoe_optimizer import get_global_esmoe_optimizer
 from megatron.core.optimizer.optimizer import ChainedOptimizer
 from megatron.training.global_vars import get_global_optimizer_param_scheduler
 from megatron.training.optimizer_param_scheduler import OptimizerParamScheduler
@@ -203,8 +206,9 @@ class SequentialMLP(MegatronModule):
         self._streams['default'] = torch.cuda.current_stream()
         self._microbatch_bwd_iter_cnt = 0
         self._bwd_ready_grad: List[Dict[str, torch.Tensor]] = [{} for _ in range(self.config.num_moe_experts)]
-        self._cpu_optimizers: List[Optional[torch.optim.Optimizer]] = [None for _ in range(self.config.num_moe_experts)]
-
+        self._optim_manager_thread: Optional[threading.Thread] = None
+        self._optim_manager_queue: Optional[queue.Queue] = None
+        self._optim_manager_completion_queue: Optional[queue.Queue] = None
         
         for exp_id in range(self.config.num_moe_experts):
             expert = MLP(self.config, submodules, is_expert=True)
@@ -314,9 +318,9 @@ class SequentialMLP(MegatronModule):
 
         # Allocate and free GPU memory for the parameter
         p._gpu = torch.zeros_like(p._cpu, device=original_device, dtype=original_dtype)
-        if p._gpu.storage().size() > 0:
+        if p._gpu.untyped_storage().size() > 0:
             assert p._gpu.storage_offset() == 0
-            p._gpu.storage().resize_(0)
+            p._gpu.untyped_storage().resize_(0)
         p.data = p._gpu
 
         p._cpu_grad = shared_pinned_memory(p.data, rank, layer, expert, order, 2, True)
@@ -325,20 +329,6 @@ class SequentialMLP(MegatronModule):
     @torch.no_grad()
     def lazy_init(self, layer_number: int) -> None:
         rank = parallel_state.get_data_parallel_rank()
-        opt_scheduler: OptimizerParamScheduler = get_global_optimizer_param_scheduler()
-        
-        assert isinstance(opt_scheduler.optimizer, ChainedOptimizer)
-        optim_config = opt_scheduler.optimizer.chained_optimizers[0].config
-        print(vars(optim_config))
-        if optim_config.optimizer == 'adam':
-            optim_cls = partial(torch.optim.Adam,
-                                lr=optim_config.lr,
-                                betas=(optim_config.adam_beta1, optim_config.adam_beta2),
-                                eps=optim_config.adam_eps,
-                                weight_decay=optim_config.weight_decay)
-        else:
-            raise ValueError(f"Optimizer {optim_config.optimizer} is not supported")
-
 
         with nvtx.annotate("LazyInit"):
             self.layer_number = layer_number
@@ -353,8 +343,15 @@ class SequentialMLP(MegatronModule):
                     param_dict['GPU'].append(p._gpu.data)
                     param_dict['CPU'].append(p._cpu.data)
                 self.experts_param_list.append(param_dict)
-                self._cpu_optimizers[exp_id] = optim_cls(param_dict['CPU'])
         self.init_stream()
+
+        self._optim_manager_thread = threading.Thread(target=self._optim_manager_main)
+        self._optim_manager_thread.start()
+        self._optim_manager_queue: queue.Queue[Tuple[int, torch.cuda.Event]] = queue.Queue()
+        self._optim_manager_completion_queue: queue.Queue[int] = queue.Queue()
+
+        for _ in range(self.num_local_experts):
+            self._optim_manager_completion_queue.put(0)  # does not matter
         self.lazy_initialized = True
 
     @torch.no_grad()
@@ -454,12 +451,43 @@ class SequentialMLP(MegatronModule):
 
             self._streams["default"].wait_stream(self._streams["computation"])
             self._bwd_ready_grad[exp_id].clear()
+        
+        with nvtx.annotate("Optimize"):
+            print(f"Optimizing GPU {parallel_state.get_expert_model_parallel_rank()} Layer {self.layer_number} EXPERT {exp_id}")
+            self._optim_manager_queue.put((exp_id, post_backward_event))
+
+            if self.config.esmoe_optimizer_mode == 'sync':
+                complete_exp_id = self._optim_manager_completion_queue.get()
+                assert exp_id == complete_exp_id
 
     @torch.no_grad()
     def wait_for_previous_optim_step(self) -> None:
         
+        if self.config.esmoe_optimizer_mode == 'async':
+            for _ in range(self.num_local_experts):
+                complete_exp_id = self._optim_manager_completion_queue.get()
+
         print("wait_for_previous_optim_step")
         ## NEED TO BE CALLED ON EVERY ITERATION, INCLUDING ACCUM
         for comm_for_event, comm_back_event in zip(self._events["comm_forward"], self._events["comm_backward"]):
             comm_for_event.synchronize()
             comm_back_event.synchronize()
+
+    def _optim_manager_main(self) -> None:
+        print(f"Starting Optim Manager for Layer {self.layer_number} RANK {parallel_state.get_expert_model_parallel_rank()}")
+        global_optim = get_global_esmoe_optimizer()
+        assert global_optim is not None, "Global Optimizer is None"
+        
+        while True:
+            exp_id, post_backward_event = self._optim_manager_queue.get()
+            if exp_id is None:
+                break
+            
+            print(f"RANK {parallel_state.get_expert_model_parallel_rank()} layer {self.layer_number} expert {exp_id} wait for bwdtx finish")
+            # wait for gradient copy to finish
+            post_backward_event.synchronize()
+            print(f"RANK {parallel_state.get_expert_model_parallel_rank()} layer {self.layer_number} expert {exp_id} starting opt")
+            global_optim.optimizer_step(self.layer_number, exp_id)
+            print(f"RANK {parallel_state.get_expert_model_parallel_rank()} layer {self.layer_number} expert {exp_id} opt finish")
+
+            self._optim_manager_completion_queue.put(exp_id)

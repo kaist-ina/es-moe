@@ -2,7 +2,7 @@
 
 import types
 from dataclasses import dataclass
-from typing import Callable, Optional, Tuple
+from typing import Callable, Literal, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -256,6 +256,7 @@ class TransformerConfig(ModelParallelConfig):
     ####################
 
     enable_esmoe: bool = False
+    esmoe_optimizer_mode: Literal["sync", "async"] = "async"
     num_experts_pin: int = 0
     """ num of pinned experts"""
     partial_offload: bool = False

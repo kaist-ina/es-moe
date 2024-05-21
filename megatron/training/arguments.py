@@ -515,6 +515,8 @@ def validate_args(args, defaults={}):
     if args.use_tp_pp_dp_mapping:
         assert args.context_parallel_size * args.expert_model_parallel_size <= 1, \
             "context_parallel and expert_model_parallel can't be used with tp-pp-dp mapping."
+        
+    assert args.esmoe_optimizer_mode in ['sync', 'async']
 
     # Print arguments.
     _print_args("arguments", args)
@@ -1643,4 +1645,5 @@ def _add_esmoe_args(parser):
     group = parser.add_argument_group(title="esmoe")
     group.add_argument('--enable-esmoe', action='store_true',
                        help='Enable ESMoE')
+    group.add_argument('--esmoe-optimizer-mode', type=str, default='async')
     return parser

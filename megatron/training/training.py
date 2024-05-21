@@ -10,6 +10,7 @@ import math
 import os
 import sys
 
+from megatron.core.parallel_state import get_tensor_model_parallel_rank
 from megatron.core.transformer.transformer_config import TransformerConfig
 from .log_handler import CustomHandler
 # Make default logging level INFO, but filter out all log messages not from MCore.
@@ -518,20 +519,22 @@ def setup_model_and_optimizer(model_provider_func,
             kwargs[f.name] = getattr(args, f.name)
     config = OptimizerConfig(**kwargs)
     config.timers = timers
-    optimizer = get_megatron_optimizer(config, model, no_wd_decay_cond,
-                                       scale_lr_cond, lr_mult)
-    opt_param_scheduler = get_optimizer_param_scheduler(optimizer)
-    set_global_optimizer_param_scheduler(opt_param_scheduler)
-    
+
+    # Enable ESMOE optimizer
     if args.enable_esmoe:
         from megatron.core.optimizer.esmoe_optimizer import initialize_esmoe_optimizer
-
         kwargs = {}
         for f in dataclasses.fields(TransformerConfig):
             if hasattr(args, f.name):
                 kwargs[f.name] = getattr(args, f.name)
         transformer_config = TransformerConfig(num_moe_experts=args.num_experts, **kwargs)
-        initialize_esmoe_optimizer(config, transformer_config)
+        initialize_esmoe_optimizer(get_tensor_model_parallel_rank(), config, transformer_config)
+
+    optimizer = get_megatron_optimizer(config, model, no_wd_decay_cond,
+                                       scale_lr_cond, lr_mult)
+    opt_param_scheduler = get_optimizer_param_scheduler(optimizer)
+    set_global_optimizer_param_scheduler(opt_param_scheduler)
+    
 
     if args.load is not None or args.pretrained_checkpoint is not None:
         timers('load-checkpoint', log_level=0).start(barrier=True)

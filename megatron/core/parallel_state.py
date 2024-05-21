@@ -728,6 +728,9 @@ def get_tensor_model_parallel_group(check_initialized=True):
         ), 'tensor model parallel group is not initialized'
     return _TENSOR_MODEL_PARALLEL_GROUP
 
+def set_tensor_model_parallel_group(v):
+    global _TENSOR_MODEL_PARALLEL_GROUP
+    _TENSOR_MODEL_PARALLEL_GROUP = v
 
 def get_pipeline_model_parallel_group():
     """Get the pipeline model parallel group the caller rank belongs to."""
