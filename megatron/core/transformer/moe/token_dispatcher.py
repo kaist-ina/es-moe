@@ -174,13 +174,17 @@ class MoEAllGatherTokenDispatcher(MoETokenDispatcher):
 
         with torch.no_grad():
             # The indices of local_indices that give its sorted order along dim 0.
+            indices_per_gpu_local = indices_per_gpu[self.local_expert_indices[0]//self.num_local_experts].cpu().type(torch.int)
             self.indices = torch.argsort(local_indices, dim=0)
-            tokens_per_expert = torch.histc(
-                local_indices,
-                bins=self.num_local_experts,
-                min=self.local_expert_indices[0],
-                max=self.local_expert_indices[-1],
-            )
+            if self.config.enable_esmoe:
+                tokens_per_expert = bincount[indices_per_gpu_local]
+            else:
+                tokens_per_expert = torch.histc(
+                    local_indices,
+                    bins=self.num_local_experts,
+                    min=self.local_expert_indices[0],
+                    max=self.local_expert_indices[-1],
+                )
             tokens_per_expert = tokens_per_expert.cpu().to(torch.long)
 
         # Stage2: permute the tokens locally so that they are grouped by their expert assignment
@@ -192,7 +196,7 @@ class MoEAllGatherTokenDispatcher(MoETokenDispatcher):
             return (
                 permuted_local_hidden_states,
                 tokens_per_expert,
-                indices_per_gpu[self.local_expert_indices[0]//self.num_local_experts].type(torch.int)
+                indices_per_gpu_local
             )
 
         return (

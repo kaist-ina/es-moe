@@ -206,7 +206,7 @@ class SequentialMLP(MegatronModule):
             self.local_experts.append(expert)
 
             if self.config.enable_esmoe: 
-                expert.register_forward_pre_hook(partial(self._pre_forward_hook, exp_id=exp_id))
+                # expert.register_forward_pre_hook(partial(self._pre_forward_hook, exp_id=exp_id))
                 # expert.register_forward_hook(partial(self._post_forward_hook, exp_id=exp_id))
                 # expert.register_full_backward_hook(partial(self._post_backward_hook, exp_id=exp_id))
 
@@ -229,12 +229,14 @@ class SequentialMLP(MegatronModule):
             zero_tensor = torch.zeros(1, dtype=torch.long, device=cumsum_num_tokens.device)
             cumsum_num_tokens = torch.cat((zero_tensor, cumsum_num_tokens))
             for just_index, expert_num in enumerate(expert_indices):
+                self._pre_forward_hook(expert_num)
                 with nvtx.annotate(f"Forward{expert_num}"):
                     expert = self.local_experts[expert_num]
                     start = cumsum_num_tokens[just_index]
                     end = cumsum_num_tokens[just_index + 1]
                     hidden = permuted_local_hidden_states[start:end]
                     output, output_bias = expert(hidden)
+                    assert output.is_cuda, f"Output of expert {expert_num} is not on GPU"
 
                     output_local[start:end] = output
                     if self.add_bias:
@@ -371,7 +373,7 @@ class SequentialMLP(MegatronModule):
                     self._events["comm_backward"][exp_id].record(self._streams["communication"])
 
     @torch.no_grad()
-    def _pre_forward_hook(self, module, args, exp_id: int) -> None:
+    def _pre_forward_hook(self, exp_id: int) -> None:
         """
         Pre-forward hook for expert layer. Will wait for comm_forward event recorded at `_upload_experts` function.
         """
@@ -379,8 +381,6 @@ class SequentialMLP(MegatronModule):
             print(f"PreFH: GPU {parallel_state.get_expert_model_parallel_rank()} Layer {self.layer_number} EXPERT {exp_id}")
             self._use_gpu_param(self.local_experts[exp_id].parameters())
             self._streams["computation"].wait_event(self._events["comm_forward"][exp_id])
-            for param in self.experts_param_list[exp_id]['GPU']:
-                print(f"PreFH: GPU {parallel_state.get_expert_model_parallel_rank()} Layer {self.layer_number} EXPERT {exp_id} Use  {hex(param.data_ptr())}")
 
     @torch.no_grad()
     def _post_forward_hook(self, exp_id: int) -> None:
@@ -388,15 +388,12 @@ class SequentialMLP(MegatronModule):
             # TODO: Use of computation stream here is redundant
             # self._streams["computation"].synchronize()
             self._use_cpu_param(self.local_experts[exp_id].parameters())
-            print(f"PosFH: GPU {parallel_state.get_expert_model_parallel_rank()} Layer {self.layer_number} EXPERT {exp_id}")
-            for param in self.experts_param_list[exp_id]['GPU']:
-                print(f"PosFH: GPU {parallel_state.get_expert_model_parallel_rank()} Layer {self.layer_number} EXPERT {exp_id} Free {hex(param.data_ptr())}")
-            free_params(self.experts_param_list[exp_id]['GPU'], self._streams['computation'].cuda_stream)
+            # print(f"PosFH: GPU {parallel_state.get_expert_model_parallel_rank()} Layer {self.layer_number} EXPERT {exp_id}")
 
     @torch.no_grad()
     def _pre_backward_hook(self, module, grad_in, exp_id: int):
         with nvtx.annotate("PreBackwardHook"):
-            print(f"PreBH: GPU {parallel_state.get_expert_model_parallel_rank()} Layer {self.layer_number} EXPERT {exp_id}")
+            # print(f"PreBH: GPU {parallel_state.get_expert_model_parallel_rank()} Layer {self.layer_number} EXPERT {exp_id}")
             self._use_gpu_param(self.local_experts[exp_id].parameters())
             self._upload_experts(exp_id, False) # this will record comm_backward event
             self._streams["computation"].wait_event(self._events["comm_backward"][exp_id])
@@ -406,12 +403,12 @@ class SequentialMLP(MegatronModule):
     @torch.no_grad()
     def _post_backward_hook_v2(self, grad: torch.Tensor, name: str, exp_id: int):
         self._bwd_ready_grad[exp_id][name] = grad
-        print(f"PostBH: GPU {parallel_state.get_expert_model_parallel_rank()} Layer {self.layer_number} EXPERT {exp_id}")
+        # print(f"PostBH: GPU {parallel_state.get_expert_model_parallel_rank()} Layer {self.layer_number} EXPERT {exp_id}")
         if len(self._bwd_ready_grad[exp_id]) < len([p for p in self.local_experts[exp_id].parameters() if p.requires_grad]):
             return
         
         with nvtx.annotate("PostBackwardHook"):
-            print(f"PosBH: GPU {parallel_state.get_expert_model_parallel_rank()} Layer {self.layer_number} EXPERT {exp_id}")
+            # print(f"PosBH: GPU {parallel_state.get_expert_model_parallel_rank()} Layer {self.layer_number} EXPERT {exp_id}")
             
             self._microbatch_bwd_iter_cnt += 1
             # TODO: offload_experts_grads does not preserve accumulation of gradients. Need to fix this.
