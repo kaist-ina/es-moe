@@ -15,9 +15,6 @@ import segment_manager
 from shared_pinned_memory import upload_experts_params, offload_experts_grads, free_params
 
 from megatron.core.optimizer.esmoe_optimizer import get_global_esmoe_optimizer
-from megatron.core.optimizer.optimizer import ChainedOptimizer
-from megatron.training.global_vars import get_global_optimizer_param_scheduler
-from megatron.training.optimizer_param_scheduler import OptimizerParamScheduler
 shared_pinned_memory = segment_manager.shared_pinned_memory
 
 from megatron.core import parallel_state
@@ -34,7 +31,6 @@ from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.moe import grouped_gemm_util as gg
 from megatron.core.transformer.moe.moe_utils import EsMoeParameter, ExpertPinState
 from megatron.core.transformer.transformer_config import TransformerConfig
-from time import sleep
 
 
 class GroupedMLP(MegatronModule):
@@ -197,32 +193,63 @@ class SequentialMLP(MegatronModule):
         self.local_experts = torch.nn.ModuleList()
 
         # ES-MoE
-        self.experts_param_list: List[Dict[Union[Literal['CPU'], Literal['GPU']], List[EsMoeParameter]]] = []
-        self._streams: Dict[str, torch.cuda.Stream] = {}
-        self._events: Dict[str, List[torch.cuda.Event]] = {}
-        self._expert_pin_states: List[ExpertPinState] = [ExpertPinState.UNPINNED for _ in range(self.config.num_moe_experts)]
-        self.layer_number: Optional[int] = None
-        self.lazy_initialized = False
-        self._streams['default'] = torch.cuda.current_stream()
-        self._microbatch_bwd_iter_cnt = 0
-        self._bwd_ready_grad: List[Dict[str, torch.Tensor]] = [{} for _ in range(self.config.num_moe_experts)]
-        self._optim_manager_thread: Optional[threading.Thread] = None
-        self._optim_manager_queue: Optional[queue.Queue] = None
-        self._optim_manager_completion_queue: Optional[queue.Queue] = None
-        
-        for exp_id in range(self.config.num_moe_experts):
-            expert = MLP(self.config, submodules, is_expert=True)
-            self.local_experts.append(expert)
+        if self.config.enable_esmoe:
+            self.experts_param_list: List[Dict[Union[Literal['CPU'], Literal['GPU']], List[EsMoeParameter]]] = []
+            self._streams: Dict[str, torch.cuda.Stream] = {}
+            self._events: Dict[str, List[torch.cuda.Event]] = {}
+            self._expert_pin_states: List[ExpertPinState] = [ExpertPinState.UNPINNED for _ in range(self.config.num_moe_experts)]
+            self.layer_number: Optional[int] = None
+            self.lazy_initialized = False
+            self._streams['default'] = torch.cuda.current_stream()
+            self._microbatch_bwd_iter_cnt = 0
+            self._bwd_ready_grad: List[Dict[str, torch.Tensor]] = [{} for _ in range(self.config.num_moe_experts)]
+            self._optim_manager_thread: Optional[threading.Thread] = None
+            self._optim_manager_queue: Optional[queue.Queue] = None
+            self._optim_manager_completion_queue: Optional[queue.Queue] = None
+            
+            for exp_id in range(self.config.num_moe_experts):
+                expert = MLP(self.config, submodules, is_expert=True)
+                self.local_experts.append(expert)
 
-            if self.config.enable_esmoe: 
-                for name, param in expert.named_parameters():
-                    param.register_hook(partial(self._post_backward_hook, name=name, exp_id=exp_id))
+                if self.config.enable_esmoe: 
+                    for name, param in expert.named_parameters():
+                        param.register_hook(partial(self._post_backward_hook, name=name, exp_id=exp_id))
 
-                expert.register_full_backward_pre_hook(partial(self._pre_backward_hook, exp_id=exp_id))
+                    expert.register_full_backward_pre_hook(partial(self._pre_backward_hook, exp_id=exp_id))
+
+        else:
+            for _ in range(self.num_local_experts):
+                expert = MLP(self.config, submodules, is_expert=True)
+                self.local_experts.append(expert)
 
     def forward(self, permuted_local_hidden_states, tokens_per_expert, expert_indices = None):
-        with torch.cuda.stream(self._streams["computation"]):
+        if self.config.enable_esmoe:
+            return self.forward_esmoe(permuted_local_hidden_states, tokens_per_expert, expert_indices)
+        
+        output_local = torch.zeros_like(permuted_local_hidden_states)
+        output_bias_local = None
+        if self.add_bias:
+            output_bias_local = torch.zeros_like(permuted_local_hidden_states)
 
+        cumsum_num_tokens = torch.cumsum(tokens_per_expert, dim=0)
+        # Insert zero at the begining for offset index's convenience
+        zero_tensor = torch.zeros(1, dtype=torch.long, device=cumsum_num_tokens.device)
+        cumsum_num_tokens = torch.cat((zero_tensor, cumsum_num_tokens))
+        for expert_num, expert in enumerate(self.local_experts):
+            start = cumsum_num_tokens[expert_num]
+            end = cumsum_num_tokens[expert_num + 1]
+            hidden = permuted_local_hidden_states[start:end]
+            output, output_bias = expert(hidden)
+
+            output_local[start:end] = output
+            if self.add_bias:
+                output_bias = output_bias.expand_as(output)
+                output_bias_local[start:end, :] = output_bias
+
+        return output_local, output_bias_local
+    
+    def forward_esmoe(self, permuted_local_hidden_states, tokens_per_expert, expert_indices = None):
+        with torch.cuda.stream(torch.cuda.current_stream()):
             output_local = torch.zeros_like(permuted_local_hidden_states)
             output_bias_local = None
             if self.add_bias:
@@ -234,6 +261,7 @@ class SequentialMLP(MegatronModule):
             cumsum_num_tokens = torch.cat((zero_tensor, cumsum_num_tokens))
             for just_index, expert_num in enumerate(expert_indices):
                 self._pre_forward_hook(expert_num)
+
                 with nvtx.annotate(f"Forward{expert_num}"):
                     expert = self.local_experts[expert_num]
                     start = cumsum_num_tokens[just_index]
@@ -246,11 +274,8 @@ class SequentialMLP(MegatronModule):
                     if self.add_bias:
                         output_bias = output_bias.expand_as(output)
                         output_bias_local[start:end, :] = output_bias
-                        
-                    self._post_forward_hook(expert_num)
         
         self._streams['default'].wait_stream(self._streams["computation"])
-
 
         return output_local, output_bias_local
 
@@ -353,18 +378,6 @@ class SequentialMLP(MegatronModule):
         for _ in range(self.num_local_experts):
             self._optim_manager_completion_queue.put(0)  # does not matter
         self.lazy_initialized = True
-
-    @torch.no_grad()
-    def _use_gpu_param(self, params: Optional[List[EsMoeParameter]] = None) -> None:
-        return
-        for p in params:
-            p.data = p._gpu
-
-    @torch.no_grad()
-    def _use_cpu_param(self, params: Optional[List[EsMoeParameter]] = None) -> None:
-        return
-        for p in params:
-            p.data = p._cpu
     
     @torch.no_grad()
     def _upload_experts(self, exp_id: int, forward = True) -> None:
@@ -378,7 +391,7 @@ class SequentialMLP(MegatronModule):
                     segment_manager.pre_backward_hook(self.layer_number, exp_id)
 
                 # will upload parameters in communication stream
-                print(f"Uploading GPU {parallel_state.get_expert_model_parallel_rank()} Layer {self.layer_number} EXPERT {exp_id}")
+                # print(f"Uploading GPU {parallel_state.get_expert_model_parallel_rank()} Layer {self.layer_number} EXPERT {exp_id}")
                 upload_experts_params(curr_exp_param_dict['CPU'], curr_exp_param_dict['GPU'], self._streams["communication"].cuda_stream)
 
                 if forward:
@@ -392,23 +405,13 @@ class SequentialMLP(MegatronModule):
         Pre-forward hook for expert layer. Will wait for comm_forward event recorded at `_upload_experts` function.
         """
         with nvtx.annotate("PreForwardHook"):
-            print(f"PreFH: GPU {parallel_state.get_expert_model_parallel_rank()} Layer {self.layer_number} EXPERT {exp_id}")
-            self._use_gpu_param(self.local_experts[exp_id].parameters())
+            # print(f"PreFH: GPU {parallel_state.get_expert_model_parallel_rank()} Layer {self.layer_number} EXPERT {exp_id}")
             self._streams["computation"].wait_event(self._events["comm_forward"][exp_id])
-
-    @torch.no_grad()
-    def _post_forward_hook(self, exp_id: int) -> None:
-        with nvtx.annotate("PostForwardHook"):
-            # TODO: Use of computation stream here is redundant
-            # self._streams["computation"].synchronize()
-            self._use_cpu_param(self.local_experts[exp_id].parameters())
-            # print(f"PosFH: GPU {parallel_state.get_expert_model_parallel_rank()} Layer {self.layer_number} EXPERT {exp_id}")
 
     @torch.no_grad()
     def _pre_backward_hook(self, module, grad_in, exp_id: int):
         with nvtx.annotate("PreBackwardHook"):
             # print(f"PreBH: GPU {parallel_state.get_expert_model_parallel_rank()} Layer {self.layer_number} EXPERT {exp_id}")
-            self._use_gpu_param(self.local_experts[exp_id].parameters())
             self._upload_experts(exp_id, False) # this will record comm_backward event
             self._streams["computation"].wait_event(self._events["comm_backward"][exp_id])
             self._streams["computation"].wait_stream(self._streams["default"])
@@ -428,8 +431,7 @@ class SequentialMLP(MegatronModule):
             # TODO: offload_experts_grads does not preserve accumulation of gradients. Need to fix this.
 
             if self._expert_pin_states[exp_id] in [ExpertPinState.UNPINNED, ExpertPinState.UNPINNING]:
-                free_params(self.experts_param_list[exp_id]['GPU'], self._streams['computation'].cuda_stream)            
-                self._use_cpu_param(self.local_experts[exp_id].parameters())
+                free_params(self.experts_param_list[exp_id]['GPU'], self._streams['computation'].cuda_stream)   
 
             self._streams['post_backward'].wait_stream(self._streams["computation"])
             with torch.cuda.stream(self._streams["post_backward"]):
@@ -453,7 +455,7 @@ class SequentialMLP(MegatronModule):
             self._bwd_ready_grad[exp_id].clear()
         
         with nvtx.annotate("Optimize"):
-            print(f"Optimizing GPU {parallel_state.get_expert_model_parallel_rank()} Layer {self.layer_number} EXPERT {exp_id}")
+            # print(f"Optimizing GPU {parallel_state.get_expert_model_parallel_rank()} Layer {self.layer_number} EXPERT {exp_id}")
             self._optim_manager_queue.put((exp_id, post_backward_event))
 
             if self.config.esmoe_optimizer_mode == 'sync':
@@ -467,14 +469,14 @@ class SequentialMLP(MegatronModule):
             for _ in range(self.num_local_experts):
                 complete_exp_id = self._optim_manager_completion_queue.get()
 
-        print("wait_for_previous_optim_step")
+        # print("wait_for_previous_optim_step")
         ## NEED TO BE CALLED ON EVERY ITERATION, INCLUDING ACCUM
         for comm_for_event, comm_back_event in zip(self._events["comm_forward"], self._events["comm_backward"]):
             comm_for_event.synchronize()
             comm_back_event.synchronize()
 
     def _optim_manager_main(self) -> None:
-        print(f"Starting Optim Manager for Layer {self.layer_number} RANK {parallel_state.get_expert_model_parallel_rank()}")
+        # print(f"Starting Optim Manager for Layer {self.layer_number} RANK {parallel_state.get_expert_model_parallel_rank()}")
         global_optim = get_global_esmoe_optimizer()
         assert global_optim is not None, "Global Optimizer is None"
         
@@ -483,11 +485,8 @@ class SequentialMLP(MegatronModule):
             if exp_id is None:
                 break
             
-            print(f"RANK {parallel_state.get_expert_model_parallel_rank()} layer {self.layer_number} expert {exp_id} wait for bwdtx finish")
             # wait for gradient copy to finish
             post_backward_event.synchronize()
-            print(f"RANK {parallel_state.get_expert_model_parallel_rank()} layer {self.layer_number} expert {exp_id} starting opt")
             global_optim.optimizer_step(self.layer_number, exp_id)
-            print(f"RANK {parallel_state.get_expert_model_parallel_rank()} layer {self.layer_number} expert {exp_id} opt finish")
-
+            
             self._optim_manager_completion_queue.put(exp_id)

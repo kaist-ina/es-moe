@@ -107,7 +107,7 @@ class MoELayer(BaseMoELayer):
             hidden_states, scores, indices
         )
 
-        print(f"GPU{parallel_state.get_expert_model_parallel_rank()} Layer{self.layer_number} FORWARD START")
+        # print(f"GPU{parallel_state.get_expert_model_parallel_rank()} Layer{self.layer_number} FORWARD START")
 
         self.experts.wait_for_previous_optim_step()
 
@@ -123,6 +123,6 @@ class MoELayer(BaseMoELayer):
 
         output, mlp_bias = self.token_dispatcher.token_unpermutation(expert_output, mlp_bias)
 
-        print (f"GPU{parallel_state.get_expert_model_parallel_rank()} Layer{self.layer_number} FORWARD DONE")
+        # print (f"GPU{parallel_state.get_expert_model_parallel_rank()} Layer{self.layer_number} FORWARD DONE")
 
         return output, mlp_bias

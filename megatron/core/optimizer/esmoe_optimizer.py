@@ -6,14 +6,12 @@ import torch.multiprocessing
 import os
 import torch
 from dataclasses import dataclass
-from megatron.core.optimizer.DeepSpeedAdam import DeepSpeedCPUAdam
 from megatron.core.optimizer.optimizer_config import OptimizerConfig
 from megatron.core.parallel_state import set_tensor_model_parallel_group
 from megatron.core.transformer.mlp import MLP
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.moe.moe_utils import ParamType
 
-import nvtx
 import segment_manager
 import pickle
 shared_pinned_memory = segment_manager.shared_pinned_memory
@@ -59,14 +57,13 @@ class EsMoeOptimizer:
         print(f"Spawning separate process for ESMoE optimizer at rank {rank}")
         self.process = mp.Process(target=self.optimizer_main)
         self.process.start()
-        print(f"Main thread will work")
 
     @torch.no_grad
     def optimizer_step(self, layer_id, expert_id):
         '''
         Called by host. This a blocking call
         '''
-        print(f"GPU{self.rank} : Optimizer step")
+        # print(f"GPU{self.rank} : Optimizer step")
         self.step_queue.put(OptimizerMessage(OptimizerMessageType.OPTIM_STEP, layer_id, expert_id))
         self.completion_queue.get() # blocking call
 
@@ -75,7 +72,7 @@ class EsMoeOptimizer:
         '''
         Called by host
         '''
-        print(f"GPU{self.rank} : Scheduler step")
+        # print(f"GPU{self.rank} : Scheduler step")
         self.step_queue.put(OptimizerMessage(OptimizerMessageType.SCHED_STEP, -1, -1, lr=lr, weight_decay=weight_decay))
         self.completion_queue.get() # blocking call
 
@@ -87,6 +84,7 @@ class EsMoeOptimizer:
         set_tensor_model_parallel_group(torch.distributed.new_group([0]))
 
         from megatron.core.models.gpt.gpt_layer_specs import _get_mlp_module_spec
+        from megatron.core.optimizer.DeepSpeedAdam import DeepSpeedCPUAdam
 
         
 
@@ -139,9 +137,7 @@ class EsMoeOptimizer:
                         # gradient variances
                         state['exp_avg_sq'] = shared_pinned_memory(p.data, self.rank, layer_id, exp_id, \
                                                                     param_id, ParamType.OPTIM_EXP_AVG_SQ, False)
-                print(f"GPU{self.rank} : Layer {layer_id} Expert {exp_id} optimizer initialized")
-
-        print("Wait to get the first message")
+            print(f"GPU{self.rank} : Layer {layer_id} optimizer initialized")
 
         while True:
             v = self.step_queue.get() # blocking call
