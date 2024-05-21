@@ -207,7 +207,7 @@ class SequentialMLP(MegatronModule):
 
             if self.config.enable_esmoe: 
                 expert.register_forward_pre_hook(partial(self._pre_forward_hook, exp_id=exp_id))
-                expert.register_forward_hook(partial(self._post_forward_hook, exp_id=exp_id))
+                # expert.register_forward_hook(partial(self._post_forward_hook, exp_id=exp_id))
                 # expert.register_full_backward_hook(partial(self._post_backward_hook, exp_id=exp_id))
 
                 # num_parameters_per_expert = len(list(expert.parameters()))
@@ -240,8 +240,11 @@ class SequentialMLP(MegatronModule):
                     if self.add_bias:
                         output_bias = output_bias.expand_as(output)
                         output_bias_local[start:end, :] = output_bias
+                        
+                    self._post_forward_hook(expert_num)
         
         self._streams['default'].wait_stream(self._streams["computation"])
+
 
         return output_local, output_bias_local
 
@@ -312,7 +315,7 @@ class SequentialMLP(MegatronModule):
         if p._gpu.storage().size() > 0:
             assert p._gpu.storage_offset() == 0
             p._gpu.storage().resize_(0)
-        p.data = p._cpu
+        p.data = p._gpu
 
         p._cpu_grad = shared_pinned_memory(p.data, rank, layer, expert, order, 2, True)
     
@@ -337,11 +340,13 @@ class SequentialMLP(MegatronModule):
 
     @torch.no_grad()
     def _use_gpu_param(self, params: Optional[List[EsMoeParameter]] = None) -> None:
+        return
         for p in params:
             p.data = p._gpu
 
     @torch.no_grad()
     def _use_cpu_param(self, params: Optional[List[EsMoeParameter]] = None) -> None:
+        return
         for p in params:
             p.data = p._cpu
     
@@ -374,14 +379,18 @@ class SequentialMLP(MegatronModule):
             print(f"PreFH: GPU {parallel_state.get_expert_model_parallel_rank()} Layer {self.layer_number} EXPERT {exp_id}")
             self._use_gpu_param(self.local_experts[exp_id].parameters())
             self._streams["computation"].wait_event(self._events["comm_forward"][exp_id])
+            for param in self.experts_param_list[exp_id]['GPU']:
+                print(f"PreFH: GPU {parallel_state.get_expert_model_parallel_rank()} Layer {self.layer_number} EXPERT {exp_id} Use  {hex(param.data_ptr())}")
 
     @torch.no_grad()
-    def _post_forward_hook(self, module, args, output, exp_id: int) -> None:
+    def _post_forward_hook(self, exp_id: int) -> None:
         with nvtx.annotate("PostForwardHook"):
             # TODO: Use of computation stream here is redundant
-            self._streams["computation"].synchronize()
+            # self._streams["computation"].synchronize()
             self._use_cpu_param(self.local_experts[exp_id].parameters())
             print(f"PosFH: GPU {parallel_state.get_expert_model_parallel_rank()} Layer {self.layer_number} EXPERT {exp_id}")
+            for param in self.experts_param_list[exp_id]['GPU']:
+                print(f"PosFH: GPU {parallel_state.get_expert_model_parallel_rank()} Layer {self.layer_number} EXPERT {exp_id} Free {hex(param.data_ptr())}")
             free_params(self.experts_param_list[exp_id]['GPU'], self._streams['computation'].cuda_stream)
 
     @torch.no_grad()
@@ -397,7 +406,7 @@ class SequentialMLP(MegatronModule):
     @torch.no_grad()
     def _post_backward_hook_v2(self, grad: torch.Tensor, name: str, exp_id: int):
         self._bwd_ready_grad[exp_id][name] = grad
-        print(f"PostBH: GPU {parallel_state.get_expert_model_parallel_rank()} Layer {self.layer_number} EXPERT {exp_id} {self._bwd_ready_grad[exp_id]}")
+        print(f"PostBH: GPU {parallel_state.get_expert_model_parallel_rank()} Layer {self.layer_number} EXPERT {exp_id}")
         if len(self._bwd_ready_grad[exp_id]) < len([p for p in self.local_experts[exp_id].parameters() if p.requires_grad]):
             return
         
@@ -421,8 +430,6 @@ class SequentialMLP(MegatronModule):
                 for name, grad in self._bwd_ready_grad[exp_id].items():
                     cpu_grads.append(param_dict[name]._cpu_grad.data)
                     assert grad is not None,f"{exp_id} {name} does not have gradient"
-                    if grad.is_cpu:
-                        print(grad)
                     assert grad.is_cuda, f"{exp_id} {name} gradient is not on GPU"
                     gpu_grads.append(grad.data)
 
