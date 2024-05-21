@@ -20,6 +20,7 @@ _GLOBAL_ONE_LOGGER = None
 _GLOBAL_ADLR_AUTORESUME = None
 _GLOBAL_TIMERS = None
 _GLOBAL_SIGNAL_HANDLER = None
+_GLOBAL_OPTIMIZER_PARAM_SCHEDULER = None
 
 def get_args():
     """Return arguments."""
@@ -236,3 +237,11 @@ def _ensure_var_is_not_initialized(var, name):
     assert var is None, '{} is already initialized.'.format(name)
 
 
+#ES-MoE
+def get_global_optimizer_param_scheduler():
+    _ensure_var_is_initialized(_GLOBAL_OPTIMIZER_PARAM_SCHEDULER, 'global optimizer param scheduler')
+    return _GLOBAL_OPTIMIZER_PARAM_SCHEDULER
+
+def set_global_optimizer_param_scheduler(optimizer_param_scheduler):
+    global _GLOBAL_OPTIMIZER_PARAM_SCHEDULER
+    _GLOBAL_OPTIMIZER_PARAM_SCHEDULER = optimizer_param_scheduler

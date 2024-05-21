@@ -13,6 +13,9 @@ from .global_vars import get_wandb_writer
 from .global_vars import get_one_logger
 from .global_vars import get_adlr_autoresume
 from .global_vars import get_timers
+#ES-MoE
+from .global_vars import get_global_optimizer_param_scheduler
+from .global_vars import set_global_optimizer_param_scheduler
 from .initialize  import initialize_megatron
 from .training import pretrain, get_model, get_train_valid_test_num_samples
 

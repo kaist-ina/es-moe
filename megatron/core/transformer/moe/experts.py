@@ -11,6 +11,10 @@ import torch.nn.functional as F
 from torch.nn.parameter import Parameter
 import segment_manager
 from shared_pinned_memory import upload_experts_params, offload_experts_grads, free_params
+
+from megatron.core.optimizer.optimizer import ChainedOptimizer
+from megatron.training.global_vars import get_global_optimizer_param_scheduler
+from megatron.training.optimizer_param_scheduler import OptimizerParamScheduler
 shared_pinned_memory = segment_manager.shared_pinned_memory
 
 from megatron.core import parallel_state
@@ -199,6 +203,7 @@ class SequentialMLP(MegatronModule):
         self._streams['default'] = torch.cuda.current_stream()
         self._microbatch_bwd_iter_cnt = 0
         self._bwd_ready_grad: List[Dict[str, torch.Tensor]] = [{} for _ in range(self.config.num_moe_experts)]
+        self._cpu_optimizers: List[Optional[torch.optim.Optimizer]] = [None for _ in range(self.config.num_moe_experts)]
 
         
         for exp_id in range(self.config.num_moe_experts):
@@ -315,9 +320,26 @@ class SequentialMLP(MegatronModule):
         p.data = p._gpu
 
         p._cpu_grad = shared_pinned_memory(p.data, rank, layer, expert, order, 2, True)
+        p._cpu.grad = p._cpu_grad
     
+    @torch.no_grad()
     def lazy_init(self, layer_number: int) -> None:
         rank = parallel_state.get_data_parallel_rank()
+        opt_scheduler: OptimizerParamScheduler = get_global_optimizer_param_scheduler()
+        
+        assert isinstance(opt_scheduler.optimizer, ChainedOptimizer)
+        optim_config = opt_scheduler.optimizer.chained_optimizers[0].config
+        print(vars(optim_config))
+        if optim_config.optimizer == 'adam':
+            optim_cls = partial(torch.optim.Adam,
+                                lr=optim_config.lr,
+                                betas=(optim_config.adam_beta1, optim_config.adam_beta2),
+                                eps=optim_config.adam_eps,
+                                weight_decay=optim_config.weight_decay)
+        else:
+            raise ValueError(f"Optimizer {optim_config.optimizer} is not supported")
+
+
         with nvtx.annotate("LazyInit"):
             self.layer_number = layer_number
             for exp_id, expert in enumerate(self.local_experts):
@@ -331,7 +353,7 @@ class SequentialMLP(MegatronModule):
                     param_dict['GPU'].append(p._gpu.data)
                     param_dict['CPU'].append(p._cpu.data)
                 self.experts_param_list.append(param_dict)
-                
+                self._cpu_optimizers[exp_id] = optim_cls(param_dict['CPU'])
         self.init_stream()
         self.lazy_initialized = True
 

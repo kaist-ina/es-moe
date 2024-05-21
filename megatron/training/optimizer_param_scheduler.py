@@ -17,6 +17,7 @@ class OptimizerParamScheduler(object):
 
         # Class values.
         self.optimizer = optimizer
+        self.optimizers_cpu = []
 
         self.init_lr = init_lr
         self.max_lr = float(max_lr)
@@ -135,6 +136,12 @@ class OptimizerParamScheduler(object):
             new_lr = self.get_lr(param_group)
             param_group['lr'] = new_lr * param_group.get('lr_mult', 1.0)
             param_group['weight_decay'] = new_wd * param_group.get('wd_mult', 1.0)
+        
+        for optim in self.optimizers_cpu:
+            for param_group in optim.param_groups:
+                new_lr = self.get_lr(param_group)
+                param_group['lr'] = new_lr * param_group.get('lr_mult', 1.0)
+                param_group['weight_decay'] = new_wd * param_group.get('wd_mult', 1.0)
 
 
     def state_dict(self):
@@ -228,3 +235,6 @@ class OptimizerParamScheduler(object):
             self.wd_incr_style = self._check_and_set(self.wd_incr_style,
                                                 sd['wd_incr_style'],
                                                 "weight decay incr style")
+            
+    def register_optimizer_cpu(self, optimizer_cpu):
+        self.optimizers_cpu.append(optimizer_cpu)
