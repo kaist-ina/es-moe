@@ -206,13 +206,8 @@ class SequentialMLP(MegatronModule):
             self.local_experts.append(expert)
 
             if self.config.enable_esmoe: 
-                # expert.register_forward_pre_hook(partial(self._pre_forward_hook, exp_id=exp_id))
-                # expert.register_forward_hook(partial(self._post_forward_hook, exp_id=exp_id))
-                # expert.register_full_backward_hook(partial(self._post_backward_hook, exp_id=exp_id))
-
-                # num_parameters_per_expert = len(list(expert.parameters()))
                 for name, param in expert.named_parameters():
-                    param.register_hook(partial(self._post_backward_hook_v2, name=name, exp_id=exp_id))
+                    param.register_hook(partial(self._post_backward_hook, name=name, exp_id=exp_id))
 
                 expert.register_full_backward_pre_hook(partial(self._pre_backward_hook, exp_id=exp_id))
 
@@ -401,7 +396,7 @@ class SequentialMLP(MegatronModule):
         
 
     @torch.no_grad()
-    def _post_backward_hook_v2(self, grad: torch.Tensor, name: str, exp_id: int):
+    def _post_backward_hook(self, grad: torch.Tensor, name: str, exp_id: int):
         self._bwd_ready_grad[exp_id][name] = grad
         # print(f"PostBH: GPU {parallel_state.get_expert_model_parallel_rank()} Layer {self.layer_number} EXPERT {exp_id}")
         if len(self._bwd_ready_grad[exp_id]) < len([p for p in self.local_experts[exp_id].parameters() if p.requires_grad]):
@@ -437,31 +432,6 @@ class SequentialMLP(MegatronModule):
 
             self._streams["default"].wait_stream(self._streams["computation"])
             self._bwd_ready_grad[exp_id].clear()
-
-    # @torch.no_grad()
-    # def _post_backward_hook(self, module, grad_in, grad_output, exp_id: int):
-    #     with nvtx.annotate("PostBackwardHook"):
-    #         print(f"PosBH: GPU {parallel_state.get_expert_model_parallel_rank()} Layer {self.layer_number} EXPERT {exp_id}")
-            
-    #         self._microbatch_bwd_iter_cnt += 1
-    #         # TODO: offload_experts_grads does not preserve accumulation of gradients. Need to fix this.
-
-    #         with torch.cuda.stream(self._streams["post_backward"]):
-    #             fp16_grads, fp32_grads = [], []
-    #             for name, param in self.local_experts[exp_id].named_parameters():
-    #                 fp32_grads.append(param._cpu_grad.data)
-    #                 assert param.grad is not None,f"{exp_id} {name} does not have gradient"
-    #                 fp16_grads.append(param.grad.data)
-
-    #             offload_experts_grads(fp32_grads, fp16_grads, self._streams["post_backward"].cuda_stream, 1)
-    #             post_backward_event = torch.cuda.Event()
-    #             post_backward_event.record(self._streams["post_backward"])
-
-    #         if self._expert_pin_states[exp_id] in [ExpertPinState.UNPINNED, ExpertPinState.UNPINNING]:
-    #             free_params(self.experts_param_list[exp_id]['GPU'], self._streams['computation'].cuda_stream)            
-    #             self._use_cpu_param(self.local_experts[exp_id].parameters())
-
-    #         self._streams["default"].wait_stream(self._streams["computation"])
 
     @torch.no_grad()
     def wait_for_previous_optim_step(self) -> None:
