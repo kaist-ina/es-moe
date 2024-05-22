@@ -339,7 +339,7 @@ class SequentialMLP(MegatronModule):
         p._cpu = p.data
 
         # Create pinned memory for the parameter and copy parameter data to pinned memory
-        p._cpu = shared_pinned_memory(p.data, rank, layer, expert, order, 1, True)
+        p._cpu = shared_pinned_memory(p.data, rank, layer, expert, order, 1, True, False)
 
         # Allocate and free GPU memory for the parameter
         p._gpu = torch.zeros_like(p._cpu, device=original_device, dtype=original_dtype)
@@ -348,7 +348,7 @@ class SequentialMLP(MegatronModule):
             p._gpu.untyped_storage().resize_(0)
         p.data = p._gpu
 
-        p._cpu_grad = shared_pinned_memory(p.data, rank, layer, expert, order, 2, True)
+        p._cpu_grad = shared_pinned_memory(p.data, rank, layer, expert, order, 2, True, False)
         p._cpu.grad = p._cpu_grad
     
     @torch.no_grad()
@@ -465,15 +465,18 @@ class SequentialMLP(MegatronModule):
     @torch.no_grad()
     def wait_for_previous_optim_step(self) -> None:
         
+        # print(f"Waiting for previous optim step GPU {parallel_state.get_expert_model_parallel_rank()} Layer {self.layer_number}")
         if self.config.esmoe_optimizer_mode == 'async':
             for _ in range(self.num_local_experts):
                 complete_exp_id = self._optim_manager_completion_queue.get()
+                # print(f"> Completed GPU {parallel_state.get_expert_model_parallel_rank()} Layer {self.layer_number} Expert {complete_exp_id} optim")
 
         # print("wait_for_previous_optim_step")
         ## NEED TO BE CALLED ON EVERY ITERATION, INCLUDING ACCUM
         for comm_for_event, comm_back_event in zip(self._events["comm_forward"], self._events["comm_backward"]):
             comm_for_event.synchronize()
             comm_back_event.synchronize()
+        # print(f"Previous optim step done GPU {parallel_state.get_expert_model_parallel_rank()} Layer {self.layer_number}")
 
     def _optim_manager_main(self) -> None:
         # print(f"Starting Optim Manager for Layer {self.layer_number} RANK {parallel_state.get_expert_model_parallel_rank()}")

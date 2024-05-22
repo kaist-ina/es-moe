@@ -41,7 +41,7 @@ PYBIND11_MODULE(segment_manager, m) {
         LocalSegmentManager::getInstance().post_optimize_hook(layer, expert);
     });
 
-    m.def("shared_pinned_memory", [] (torch::Tensor tensor, int rank, int layer, int expert, int order, int type, bool pinning = true) {
-        return LocalSegmentManager::getInstance().shared_pinned_memory(tensor, rank, layer, expert, order, type, pinning);
+    m.def("shared_pinned_memory", [] (torch::Tensor tensor, int rank, int layer, int expert, int order, int type, bool pinning = true, bool skip_initialization = false) {
+        return LocalSegmentManager::getInstance().shared_pinned_memory(tensor, rank, layer, expert, order, type, pinning, skip_initialization);
     });
 }

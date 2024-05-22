@@ -1,7 +1,8 @@
 
 from enum import Enum
 from functools import partial
-from typing import List, Optional
+from queue import Empty
+from typing import List, Optional, Set
 import torch.multiprocessing
 import os
 import torch
@@ -26,6 +27,7 @@ class OptimizerMessageType(Enum):
 
 @dataclass
 class OptimizerMessage:
+    message_id: int
     message_type: OptimizerMessageType
     layer_id: int
     expert_id: int
@@ -53,10 +55,13 @@ class EsMoeOptimizer:
         self.optimizers: List[List[torch.optim.Optimizer]] = []
 
         self.step_queue: torch.multiprocessing.Queue[Optional[OptimizerMessage]] = mp.Queue()
-        self.completion_queue: torch.multiprocessing.Queue[Optional[OptimizerMessage]] = mp.Queue()
+        self.completion_queue: torch.multiprocessing.Queue[Optional[int]] = mp.Queue()
+        self.completion_set: Set[int] = set()
         print(f"Spawning separate process for ESMoE optimizer at rank {rank}")
         self.process = mp.Process(target=self.optimizer_main)
         self.process.start()
+
+        self._message_id: int = 0
 
     @torch.no_grad
     def optimizer_step(self, layer_id, expert_id):
@@ -64,8 +69,12 @@ class EsMoeOptimizer:
         Called by host. This a blocking call
         '''
         # print(f"GPU{self.rank} : Optimizer step")
-        self.step_queue.put(OptimizerMessage(OptimizerMessageType.OPTIM_STEP, layer_id, expert_id))
-        self.completion_queue.get() # blocking call
+        self._message_id += 1
+        msg_id = self._message_id
+        # print(f"[{os.getpid()}] Opt L{layer_id} E{expert_id} : Optimizer step requested, message id {msg_id}")
+        self.step_queue.put(OptimizerMessage(msg_id, OptimizerMessageType.OPTIM_STEP, layer_id, expert_id))
+        self.wait_until_complete(msg_id)
+        # print(f"[{os.getpid()}] Opt L{layer_id} E{expert_id} : Optimizer step finished,  message id {msg_id} remaining {self.completion_set}")
 
     @torch.no_grad
     def scheduler_step(self, lr: float, weight_decay: float):
@@ -73,9 +82,24 @@ class EsMoeOptimizer:
         Called by host
         '''
         # print(f"GPU{self.rank} : Scheduler step")
-        self.step_queue.put(OptimizerMessage(OptimizerMessageType.SCHED_STEP, -1, -1, lr=lr, weight_decay=weight_decay))
-        self.completion_queue.get() # blocking call
+        self._message_id += 1
+        self.step_queue.put(OptimizerMessage(-1, OptimizerMessageType.SCHED_STEP, -1, -1, lr=lr, weight_decay=weight_decay))
 
+    def wait_until_complete(self, msg_id: int):
+        '''
+        Called by host
+        '''
+        assert msg_id >= 0, "Invalid message id"
+
+        while msg_id not in self.completion_set:
+            try:
+                v = self.completion_queue.get(timeout=0.001)
+                if v >= 0:
+                    self.completion_set.add(v)
+            except Empty:
+                pass
+        
+        self.completion_set.remove(msg_id)
 
     def optimizer_main(self):
         
@@ -105,16 +129,16 @@ class EsMoeOptimizer:
             num_experts=self.transformer_config.num_moe_experts, 
             moe_grouped_gemm=self.transformer_config.moe_grouped_gemm)
         
-        for layer_id in range(self.transformer_config.num_layers):
+        for layer_id in range(1, self.transformer_config.num_layers+1): # layer_id starts from 1
             self.experts.append([])
             self.optimizers.append([])
             for exp_id in range(self.transformer_config.num_moe_experts):
                 expert = MLP(self.transformer_config, mlp_spec.submodules, is_expert=True)
                 self.experts[-1].append(expert)
                 for param_id, p in enumerate(expert.parameters()):
-                    p.data = shared_pinned_memory(p.data, self.rank, layer_id, exp_id, param_id, ParamType.PARAM, False)
+                    p.data = shared_pinned_memory(p.data, self.rank, layer_id, exp_id, param_id, ParamType.PARAM, False, True) # skip copy from p.data
                     # if update_freq == 1:
-                    p.grad = shared_pinned_memory(p.data, self.rank, layer_id, exp_id, param_id, ParamType.GRAD, False)
+                    p.grad = shared_pinned_memory(p.data, self.rank, layer_id, exp_id, param_id, ParamType.GRAD, False, True) # skip copy from p.data
                 
 
                     assert p.is_cpu
@@ -128,15 +152,15 @@ class EsMoeOptimizer:
                         
                         ## make the step shared tensor memory -> modify the deepsped CPU Adam, too
                         state['step'] = shared_pinned_memory(torch.tensor(0.), self.rank, layer_id, exp_id, \
-                                                                    param_id, ParamType.OPTIM_STEP, False)
+                                                                    param_id, ParamType.OPTIM_STEP, False, True)
 
                         # gradient momentum
                         state['exp_avg'] = shared_pinned_memory(p.data, self.rank, layer_id, exp_id, \
-                                                                    param_id, ParamType.OPTIM_EXP_AVG, False)
+                                                                    param_id, ParamType.OPTIM_EXP_AVG, False, True)
                         
                         # gradient variances
                         state['exp_avg_sq'] = shared_pinned_memory(p.data, self.rank, layer_id, exp_id, \
-                                                                    param_id, ParamType.OPTIM_EXP_AVG_SQ, False)
+                                                                    param_id, ParamType.OPTIM_EXP_AVG_SQ, False, True)
             print(f"GPU{self.rank} : Layer {layer_id} optimizer initialized")
 
         while True:
@@ -146,22 +170,20 @@ class EsMoeOptimizer:
                 break
         
             if v.message_type == OptimizerMessageType.OPTIM_STEP:
-                segment_manager.pre_optimize_hook(layer_id, exp_id)
+                segment_manager.pre_optimize_hook(v.layer_id, v.expert_id)
                 # with nvtx.annotate('step'):
                 #     self.optimizers[layer_id][exp_id].step()
-                for pg in self.optimizers[layer_id][exp_id].param_groups:
-                    for param_id, p in enumerate(pg['params']):
-                        assert p.is_cpu
-                        assert p.grad.is_cpu
-                segment_manager.post_optimize_hook(layer_id, exp_id)
-                self.completion_queue.put(v)
+                # print(f"GPU{self.rank} : Layer {v.layer_id} expert {v.expert_id} optimizer step")
+                self.optimizers[v.layer_id-1][v.expert_id].step()
+                segment_manager.post_optimize_hook(v.layer_id, v.expert_id)
+                self.completion_queue.put(v.message_id)
             elif v.message_type == OptimizerMessageType.SCHED_STEP:
-                for layer_id in range(self.transformer_config.num_layers):
+                for layer_id in range(1, self.transformer_config.num_layers):
                     for exp_id in range(self.transformer_config.num_moe_experts):
-                        for param_group in self.optimizers[layer_id][exp_id].param_groups:
+                        for param_group in self.optimizers[layer_id-1][exp_id].param_groups:
                             param_group['lr'] = v.lr
                             param_group['weight_decay'] = v.weight_decay
-                self.completion_queue.put(v)
+                self.completion_queue.put(v.message_id)
             else:
                 raise ValueError(f"Invalid message type {v.message_type}")
         

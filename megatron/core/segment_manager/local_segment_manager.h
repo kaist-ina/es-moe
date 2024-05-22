@@ -85,7 +85,7 @@ public:
     void pre_optimize_hook(layer_id_t layer, expert_id_t expert);
     void post_optimize_hook(layer_id_t layer, expert_id_t expert);
 
-    torch::Tensor shared_pinned_memory(torch::Tensor tensor, int rank, int layer, int expert, int order, int type, bool pinning);
+    torch::Tensor shared_pinned_memory(torch::Tensor tensor, int rank, int layer, int expert, int order, int type, bool pinning, bool skip_initialization = false);
 
 };
 

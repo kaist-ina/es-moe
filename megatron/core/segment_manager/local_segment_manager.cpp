@@ -265,7 +265,7 @@ void LocalSegmentManager::cuda_unregister_segment(MemorySegment &segment) {
     segment.currently_pinned() = false;
 }
 
-torch::Tensor LocalSegmentManager::shared_pinned_memory(torch::Tensor tensor, int rank, int layer, int expert, int order, int type, bool pinning) {
+torch::Tensor LocalSegmentManager::shared_pinned_memory(torch::Tensor tensor, int rank, int layer, int expert, int order, int type, bool pinning, bool skip_initialization) {
     if (!is_disable_ssd_offload() && !is_initialized_) {
         // fprintf(stderr, "LocalSegmentManager is not initialized, force initializing with rank=%d\n", rank);
         initialize(rank, {}, true);
@@ -280,7 +280,7 @@ torch::Tensor LocalSegmentManager::shared_pinned_memory(torch::Tensor tensor, in
     auto shared_tensor = torch::from_blob(memory_segment, tensor.sizes(), tensor.dtype());
 
     // NOTE: Only Params need initialization
-    if ((rank == 0) && static_cast<MemorySegmentKey::Type>(type) == MemorySegmentKey::Type::PARAMETER) {
+    if (!skip_initialization && (rank == 0) && static_cast<MemorySegmentKey::Type>(type) == MemorySegmentKey::Type::PARAMETER) {
         shared_tensor.copy_(tensor);
     }
 
