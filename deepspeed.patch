@@ -1,0 +1,12 @@
+diff --git a/op_builder/builder.py b/op_builder/builder.py
+index 8dc825c7..c5024adf 100644
+--- a/op_builder/builder.py
++++ b/op_builder/builder.py
+@@ -366,6 +366,7 @@ class OpBuilder(ABC):
+         return '-march=native'
+ 
+     def is_cuda_enable(self):
++        return '-D__DISABLE_CUDA__'
+         try:
+             assert_no_cuda_mismatch(self.name)
+             return '-D__ENABLE_CUDA__'

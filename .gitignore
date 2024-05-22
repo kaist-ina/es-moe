@@ -14,3 +14,5 @@ gpt2-vocab.json
 **/*.bin
 **/*.idx
 my-gpt2_text_document
+
+deps
