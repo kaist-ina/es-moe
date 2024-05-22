@@ -371,9 +371,9 @@ class SequentialMLP(MegatronModule):
         self.init_stream()
 
         self._optim_manager_thread = threading.Thread(target=self._optim_manager_main)
-        self._optim_manager_thread.start()
         self._optim_manager_queue: queue.Queue[Tuple[int, torch.cuda.Event]] = queue.Queue()
         self._optim_manager_completion_queue: queue.Queue[int] = queue.Queue()
+        self._optim_manager_thread.start()
 
         for _ in range(self.num_local_experts):
             self._optim_manager_completion_queue.put(0)  # does not matter
