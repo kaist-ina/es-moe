@@ -26,7 +26,7 @@ DISTRIBUTED_ARGS="
 "
 
 GPT_ARGS="
-    --num-layers 4 \
+    --num-layers 2 \
     --hidden-size 1024 \
     --num-attention-heads 16 \
     --seq-length 1024 \
@@ -46,7 +46,8 @@ GPT_ARGS="
     --expert-model-parallel-size 4 \
     --moe-router-topk 1 \
     --use-distributed-optimizer \
-    --enable-esmoe
+    --enable-esmoe \
+    --moe-token-dispatcher-type alltoall
 "
 
 DATA_ARGS="

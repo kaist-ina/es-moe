@@ -103,26 +103,66 @@ class MoELayer(BaseMoELayer):
 
         # process MoE
         scores, indices = self.router(hidden_states)
+        
+        # if parallel_state.get_expert_model_parallel_rank() == 1:
+        #     for i in range(indices.shape[0]):
+        #         print (indices[i][0].item(), end="")
+        #         if i%50==0: print ()
         (dispatched_input, tokens_per_expert, expert_indices) = self.token_dispatcher.token_permutation(
             hidden_states, scores, indices
         )
+        # print ("PERM END")
 
         # print(f"GPU{parallel_state.get_expert_model_parallel_rank()} Layer{self.layer_number} FORWARD START")
 
         self.experts.wait_for_previous_optim_step()
-
+        # print ("WAIT END")
         event_non_expert_compute = torch.cuda.Event()
         event_non_expert_compute.record()
         for expert_index in expert_indices:
+            # print ("IN EXPT UPLOAD LOOP")
             # probably can wait computation stream instead of communication stream
             self.experts._streams["communication"].wait_event(event_non_expert_compute)
-            self.experts._upload_experts(expert_index.item(), True)
-
+            self.experts._upload_experts(expert_index, True)
+        # print ("EXPT UPLOAD END")
         # call to self.expert will make the default stream wait for the computation stream to finish
         expert_output, mlp_bias = self.experts(dispatched_input, tokens_per_expert, expert_indices)
+        # if parallel_state.get_expert_model_parallel_rank() == 0:
+        #     cnt=0
+        #     for i in reversed(range(expert_output.shape[0])):
+        #         cnt+=1
+        #         if cnt==30: break
+        #         print (expert_output[i])
+        # if parallel_state.get_expert_model_parallel_rank() == 1:
+        #     cnt = 0
+        #     for i in reversed(range(expert_output.shape[0])):
+        #         cnt+=1
+        #         if cnt==400: break
+        #         print (expert_output[i])
+        #     print ()
+        # print (f"GPU {parallel_state.get_expert_model_parallel_rank()} expertOutput {expert_output.shape}")
+        # print (f"GPU {parallel_state.get_expert_model_parallel_rank()} bias {mlp_bias.shape}")
+        # output, mlp_bias = self.token_dispatcher.token_unpermutation(expert_output, mlp_bias)
+        # return output, mlp_bias
+        #print (f"GPU {parallel_state.get_expert_model_parallel_rank()} BIAS {mlp_bias}")
+        # print ("UNPERM START")
+        output = self.token_dispatcher.token_unpermutation(expert_output)
+        # print ("UNPERM---------")
+        mlp_bias = self.token_dispatcher.token_unpermutation(mlp_bias)
+        #print (f"GPU {parallel_state.get_expert_model_parallel_rank()} OUTPUT {output}")
 
-        output, mlp_bias = self.token_dispatcher.token_unpermutation(expert_output, mlp_bias)
+        # if parallel_state.get_expert_model_parallel_rank() == 0:
+        #     # print (f"output after unperm (shape {output.shape}): {output}")
 
         # print (f"GPU{parallel_state.get_expert_model_parallel_rank()} Layer{self.layer_number} FORWARD DONE")
 
+        # if parallel_state.get_expert_model_parallel_rank() == 1:
+        #     cnt = 0
+        #     for i in reversed(range(1024)):
+        #         cnt+=1
+        #         if cnt==400: break
+        #         print (output[1023][7][i])
+        #     print ()
+
+                
         return output, mlp_bias

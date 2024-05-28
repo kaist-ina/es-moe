@@ -7,7 +7,7 @@ import torch
 
 from megatron.core import parallel_state, tensor_parallel
 from megatron.core.tensor_parallel.mappings import _gather_along_first_dim_expert_parallel
-from megatron.core.transformer.moe.moe_utils import permute, unpermute
+from megatron.core.transformer.moe.moe_utils import permute, unpermute, permute2
 from megatron.core.transformer.transformer_config import TransformerConfig
 
 
@@ -115,15 +115,32 @@ class MoEAllGatherTokenDispatcher(MoETokenDispatcher):
             global_hidden_states = tensor_parallel.gather_from_sequence_parallel_region_to_moe(
                 hidden_states
             )
+            # print (torch.var(global_hidden_states))
             with torch.no_grad():
                 global_indices = tensor_parallel.gather_from_sequence_parallel_region_to_moe(
                     max_ind
                 )
+                # bincount = torch.bincount(torch.squeeze(global_indices))
+                # if parallel_state.get_expert_model_parallel_rank() == 0:
+                #         print (f"BINCOUNT {bincount}")
+                #         cnt = 0
+                #         for i in range(498765):
+                #             for j in range(2):
+                #                 if i%2==0:
+                #                     cnt += i
+                #                 else: cnt -= i
+                # if parallel_state.get_expert_model_parallel_rank() == 0:
+                #         for i in range(global_indices.shape[0]):
+                #             print (global_indices[i].item(), end="")
+                #             if i%50==0: print ()
 
                 if self.config.enable_esmoe:
                     # expert placement algorithm -- needs to be optimized
                     # number of tokens per expert
                     bincount = torch.bincount(torch.squeeze(global_indices.cpu()))
+                    # if parallel_state.get_expert_model_parallel_rank() == 0:
+                    #     print ()
+                    #     print (f"bincount {bincount}")
                     sorted_bincount, sorted_expert_indices = torch.sort(bincount, descending=True)
                     gpu_token_assign_count = torch.zeros(self.num_gpus)
                     indices_per_gpu = torch.zeros((self.num_gpus, self.num_experts//self.num_gpus))
@@ -340,6 +357,10 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         self.input_splits = None
         self.output_splits = None
         self.num_global_tokens_per_local_expert = None
+        self.indices_per_gpu = None
+        self.num_gpus = parallel_state.get_expert_model_parallel_world_size()
+        self.num_global_tokens_per_expert = None
+        self.num_local_tokens_per_expert = None
 
     def preprocess(self, indices: torch.Tensor) -> torch.Tensor:
         """
@@ -356,6 +377,7 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         num_local_tokens_per_expert = torch.histc(
             indices, bins=self.num_experts, min=0, max=self.num_experts
         )
+        self.num_local_tokens_per_expert = num_local_tokens_per_expert
         # num_local_tokens_per_expert: [num_experts]
 
         ep_size = self.config.expert_model_parallel_size
@@ -363,15 +385,35 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             # ===================================================
             # Calculate input_splits, output_splits for alltoall-v.
             # ===================================================
+            num_global_tokens_per_expert = _gather_along_first_dim_expert_parallel(
+                num_local_tokens_per_expert
+            ).reshape(ep_size, self.num_experts)
+            self.num_global_tokens_per_expert = num_global_tokens_per_expert
+            ##########
+            bincount = num_global_tokens_per_expert.sum(axis=0).to(torch.device("cpu"))
+            sorted_bincount, sorted_expert_indices = torch.sort(bincount, descending=True)
+            gpu_token_assign_count = torch.zeros(self.num_gpus)
+            indices_per_gpu = torch.zeros((self.num_gpus, self.num_experts//self.num_gpus))
+            indices_per_gpu_append = torch.zeros(self.num_gpus)
+            for index in sorted_expert_indices:
+                gpu_index = torch.argmin(gpu_token_assign_count)
+                indices_per_gpu[gpu_index][int(indices_per_gpu_append[gpu_index])]=index
+                indices_per_gpu_append[gpu_index]+=1
+                gpu_token_assign_count[gpu_index]+=bincount[index]
+                if indices_per_gpu_append[gpu_index]==self.num_experts//self.num_gpus:
+                    gpu_token_assign_count[gpu_index]+=98765
+            rank = parallel_state.get_expert_model_parallel_rank()
+            self.local_expert_indices = list(indices_per_gpu[rank].type(torch.int32))
+            self.indices_per_gpu = indices_per_gpu
+            indices_per_gpu_int = indices_per_gpu.type(torch.int32)
+            new_num_local_tokens_per_expert = num_local_tokens_per_expert[indices_per_gpu_int.flatten()]
             self.input_splits = (
-                num_local_tokens_per_expert.reshape(ep_size, self.num_local_experts)
+                new_num_local_tokens_per_expert.reshape(ep_size, self.num_local_experts)
                 .sum(axis=1)
                 .to(torch.device("cpu"))
                 .numpy()
             )
-            num_global_tokens_per_expert = _gather_along_first_dim_expert_parallel(
-                num_local_tokens_per_expert
-            ).reshape(ep_size, self.num_experts)
+            ##########
             self.num_global_tokens_per_local_expert = num_global_tokens_per_expert[
                 :, self.local_expert_indices
             ]
@@ -400,6 +442,7 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
                 dtype=torch.int32,
                 device=torch.cuda.current_device(),
             )
+            # print (f"GPU {parallel_state.get_expert_model_parallel_rank()} GT per LocalExpt {self.num_global_tokens_per_local_expert}")
             self.global_input_tokens_local_experts_indices = torch.repeat_interleave(
                 expert_ids_per_ep_rank, self.num_global_tokens_per_local_expert.ravel()
             )
@@ -437,11 +480,10 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         # hidden_states: [S*B/TP, H] -> [S*B, H/TP]
         if parallel_state.get_tensor_model_parallel_world_size() > 1:
             hidden_states = tensor_parallel.all_to_all_sp2hp(hidden_states)
-
         # Permutation 1: input to AlltoAll input
         self.local_input_tokens_global_experts_indices = indices
-        permutated_local_input_tokens, self.reversed_local_input_permutation_mapping = permute(
-            hidden_states, self.local_input_tokens_global_experts_indices, topk=self.router_topk,
+        permutated_local_input_tokens, self.reversed_local_input_permutation_mapping = permute2(
+            hidden_states, self.local_input_tokens_global_experts_indices, self.num_local_tokens_per_expert, self.indices_per_gpu, topk=self.router_topk
         )
 
         # Perform expert parallel AlltoAll communication
@@ -451,6 +493,7 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             self.output_splits,
             self.input_splits,
         )
+        # print (f"GPU {parallel_state.get_expert_model_parallel_rank()} GIT {tokens_per_expert}")
 
         # Permutation 2: AlltoAll output to expert input if num_local_experts > 1
         if self.num_local_experts > 1:
@@ -464,8 +507,9 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             global_input_tokens = tensor_parallel.all_gather_last_dim_from_tensor_parallel_region(
                 global_input_tokens
             )
-
-        return global_input_tokens, tokens_per_expert
+        # print (f"GPU {parallel_state.get_expert_model_parallel_rank()} GIT.shape {global_input_tokens.shape}")
+        # print (f"GPU {parallel_state.get_expert_model_parallel_rank()} TPE {tokens_per_expert}")
+        return global_input_tokens, tokens_per_expert, self.local_expert_indices
 
     def token_unpermutation(
         self, hidden_states: torch.Tensor, bias: torch.Tensor = None,
@@ -521,4 +565,4 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
 
         # Reshape the output tensor
         output = output.view(self.hidden_shape)
-        return output, None
+        return output

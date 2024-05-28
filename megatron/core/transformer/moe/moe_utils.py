@@ -104,7 +104,6 @@ class MoEAuxLossAutoScaler(torch.autograd.Function):
         """
         MoEAuxLossAutoScaler.main_loss_backward_scale = scale
 
-
 def permute(tokens, indices, topk: int = 1):
     """Permute the tokens based on the indices. Token with the same index will be grouped together.
 
@@ -122,6 +121,21 @@ def permute(tokens, indices, topk: int = 1):
     sorted_indices = torch.argsort(flatten_indices, stable=True)
     permuted_tokens = tokens.index_select(0, sorted_indices // topk)
     return permuted_tokens, sorted_indices
+
+def permute2(tokens, indices, num_local_tokens_per_expert, indices_per_gpu, topk: int = 1):
+
+    if topk > 1:
+        assert indices.size(1) == topk
+    mask = torch.tensor([], dtype=torch.int32, device=tokens.device)
+    flatten_indices_per_gpu = indices_per_gpu.view(-1)
+    flatten_indices = indices.view(-1)
+    sorted_indices = torch.argsort(flatten_indices, stable=True)
+    cnt = 0
+    for i in range(len(num_local_tokens_per_expert)):
+        mask = torch.cat((mask, sorted_indices[cnt : cnt+num_local_tokens_per_expert[i]]))
+        cnt = cnt + num_local_tokens_per_expert[i]
+    permuted_tokens = tokens.index_select(0, mask)
+    return permuted_tokens, mask
 
 
 def unpermute(permuted_tokens, sorted_indices, probs: torch.Tensor = None, topk: int = 1):
