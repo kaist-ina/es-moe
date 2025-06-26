@@ -1,3 +1,54 @@
+Okay, here's a README for ES-MoE, structured similarly to the StellaTrain README and based on the information from the ES-MoE paper you provided.
+
+---
+
+# ES-MoE (ICML 2024)
+
+This repository provides a public version of the ES-MoE implementation, designed for scaling Mixture-of-Experts (MoE) model training beyond GPU memory limits.
+
+## Project Structure
+
+The core components of ES-MoE are organized as follows, mapping to the concepts described in the paper:
+
+*   **Expert-wise Offload and Processing (`esmoe/core/`, `esmoe/offload/`)**:
+    *   `esmoe/core/pipeline_manager.py` (and/or C++ backend): Manages the pipelined expert processing, overlapping GPU-CPU communication with expert computation. &rarr; **4.1 Pipelined expert processing**
+    *   `esmoe/core/cpu_optimizer_handler.py` (integrating e.g., DeepSpeed's CPU Adam): Handles expert-wise CPU-based optimization initiated as each expert's backward pass completes. &rarr; **4.1 Expert-wise CPU-based optimization**
+    *   `esmoe/offload/host_memory_manager.py`: Manages offloading and prefetching of expert parameters and optimizer states to host (CPU) memory.
+    *   `esmoe/offload/ssd_storage_manager.py`: Extends offloading to SSDs using a VM-like method with LRU prefetching for virtually unlimited scaling. &rarr; **4.1 Offloading experts to SSD**
+    *   `esmoe/core/sequential_dispatch.py`: Implements sequential token assignment to experts, enabling larger batch sizes by avoiding large dispatch masks. &rarr; **4.1 Supporting larger batches**
+
+*   **Dynamic Expert Placement (`esmoe/placement/`)**:
+    *   `esmoe/placement/dynamic_scheduler.py`: Implements the greedy scheduling algorithm for dynamic expert placement on GPUs to balance load per-batch. &rarr; **4.2 Dynamic Expert Placement on GPUs**
+
+*   **Adaptive Offloading (`esmoe/adaptive/`)**:
+    *   `esmoe/adaptive/offload_controller.py`: Determines the degree of expert offloading (GPU-only, CPU offload, SSD offload) and manages expert pinning based on current model size, expert count, and available resources. &rarr; **4.3 Adaptive Offloading**
+
+*   **Integration (e.g., within a modified Fairseq or similar framework)**:
+    *   `fairseq_modifications/moe_layer_es.py`: Example of how ES-MoE components would be integrated into an MoE layer within a training framework like Fairseq.
+
+*   **Scripts & Examples (`scripts/`)**:
+    *   Contains shell scripts to launch training for dummy data and real datasets like WikiText-103.
+
+## How to run experiments
+
+### Setup
+
+Hardware requirements for running the experiments are as follows:
+*   At least 1 node with high-end NVIDIA GPUs. The paper uses a node with 4x NVIDIA A100 40GB GPUs.
+*   Sufficient CPU RAM (e.g., 512GB as used in the paper, or more for larger models/expert counts).
+*   High-speed SSD storage if testing SSD offloading capabilities (e.g., NVMe SSDs).
+*   For multi-node distributed training (though the paper focuses on single-node multi-GPU scaling beyond memory): Network connectivity between nodes.
+
+We recommend using cloud instances for experiments. For example, on AWS EC2:
+*   A `p4d.24xlarge` instance (8x A100 40GB GPUs) or multiple `g5` instances (A10G GPUs). For replicating the paper's setup, a single node with 4x A100 40GB is the target.
+*   [Deep Learning Base AMI (Amazon Linux 2) or Ubuntu equivalent](https://docs.aws.amazon.com/dlami/latest/devguide/overview-base.html)
+*   Disk space: Sufficient for OS, codebase, datasets, and potential model checkpoints (e.g., 200GB OS disk + large NVMe for SSD offload).
+*   Allow **all TCP ports** in the security group if running multi-node experiments, or ensure necessary ports for single-node NCCL communication are open.
+
+### Run container image
+Execute the script to build and run the Docker image.
+It pulls the image from `ghcr.io/kaist-ina/es-moe:main`  and launches bash inside the Docker container.
+
 <div align="center">
 
 Megatron-LM & Megatron-Core
