@@ -1,7 +1,3 @@
-Okay, here's a README for ES-MoE, structured similarly to the StellaTrain README and based on the information from the ES-MoE paper you provided.
-
----
-
 # ES-MoE (ICML 2024)
 
 This repository provides a public version of the ES-MoE implementation, designed for scaling Mixture-of-Experts (MoE) model training beyond GPU memory limits.
